@@ -7,7 +7,14 @@
 // In a 3DS user process, mapped IO uses +0x0EB00000 virtual offset.
 #define PDN_I2S_CNT_ADDR  ((uintptr_t)0x1EC41220)
 #define PDN_DSP_CNT_ADDR  ((uintptr_t)0x1EC41230)
-#define REG8_RO(addr) (*(volatile const u8 *)(addr))
+
+// I2S controller registers:
+// physical 0x10145000/0x10145002 -> user virtual 0x1EC45000/0x1EC45002.
+#define I2S1_CNT_ADDR     ((uintptr_t)0x1EC45000)
+#define I2S2_CNT_ADDR     ((uintptr_t)0x1EC45002)
+
+#define REG8_RO(addr)  (*(volatile const u8  *)(addr))
+#define REG16_RO(addr) (*(volatile const u16 *)(addr))
 
 #define TONE_RATE       22050
 #define TONE_SECONDS    2
@@ -36,6 +43,11 @@ typedef struct {
 } PdnSnapshot;
 
 typedef struct {
+    u16 i2s1;
+    u16 i2s2;
+} I2sHwSnapshot;
+
+typedef struct {
     Result rc0;
     Result rc40;
     bool valid0;
@@ -47,6 +59,7 @@ typedef struct {
     bool attempted;
     Result cdcInitRc;
     PdnSnapshot pdn;
+    I2sHwSnapshot i2sHw;
     CodecPageDump page[CODEC_PAGE_COUNT];
 } CodecSnapshot;
 
@@ -60,6 +73,7 @@ typedef struct {
 } AudioCodecTest;
 
 static PdnSnapshot startup;
+static I2sHwSnapshot startupI2s;
 static CodecSnapshot baselineCodec;
 static AudioCodecTest ndspTest;
 static AudioCodecTest csndTest;
@@ -69,6 +83,14 @@ static PdnSnapshot read_pdn(void)
     PdnSnapshot s;
     s.i2s = REG8_RO(PDN_I2S_CNT_ADDR);
     s.dsp = REG8_RO(PDN_DSP_CNT_ADDR);
+    return s;
+}
+
+static I2sHwSnapshot read_i2s_hw(void)
+{
+    I2sHwSnapshot s;
+    s.i2s1 = REG16_RO(I2S1_CNT_ADDR);
+    s.i2s2 = REG16_RO(I2S2_CNT_ADDR);
     return s;
 }
 
@@ -86,11 +108,27 @@ static void print_pdn(PdnSnapshot s)
            !!(s.i2s & BIT(1)));
 }
 
+static void print_i2s_hw(I2sHwSnapshot s)
+{
+    printf("I2S1_CNT=0x%04X en=%u freq=%u mclk=%u vol=%u\n",
+           s.i2s1,
+           !!(s.i2s1 & BIT(15)),
+           !!(s.i2s1 & BIT(13)),
+           !!(s.i2s1 & BIT(14)),
+           (unsigned)(s.i2s1 & 0x3F));
+    printf("I2S2_CNT=0x%04X en=%u freq=%u mclk=%u\n",
+           s.i2s2,
+           !!(s.i2s2 & BIT(15)),
+           !!(s.i2s2 & BIT(13)),
+           !!(s.i2s2 & BIT(14)));
+}
+
 static bool capture_codec(CodecSnapshot *out)
 {
     memset(out, 0, sizeof(*out));
     out->attempted = true;
     out->pdn = read_pdn();
+    out->i2sHw = read_i2s_hw();
 
     out->cdcInitRc = cdcChkInit();
     if (R_FAILED(out->cdcInitRc))
@@ -262,11 +300,12 @@ static unsigned count_valid_pages(const CodecSnapshot *s)
 static void draw(void)
 {
     printf("\x1b[2J\x1b[H");
-    printf("3DS Audio I2S Diagnostic v0.4\n");
-    printf("CODEC register comparison - READ ONLY\n\n");
+    printf("3DS Audio I2S Diagnostic v0.5\n");
+    printf("I2S controller + CODEC - READ ONLY\n\n");
 
-    printf("STARTUP: ");
+    printf("STARTUP:\n");
     print_pdn(startup);
+    print_i2s_hw(startupI2s);
     printf("\n");
 
     if (!baselineCodec.attempted) {
@@ -275,6 +314,8 @@ static void draw(void)
         printf("[A] Baseline cdc:CHK: 0x%08lX %s\n",
                (unsigned long)baselineCodec.cdcInitRc,
                okfail(baselineCodec.cdcInitRc));
+        printf("    I2S1=0x%04X I2S2=0x%04X\n",
+               baselineCodec.i2sHw.i2s1, baselineCodec.i2sHw.i2s2);
         printf("    full pages read: %u/%u\n",
                count_valid_pages(&baselineCodec),
                (unsigned)CODEC_PAGE_COUNT);
@@ -288,6 +329,8 @@ static void draw(void)
                (unsigned long)ndspTest.audioInitRc,
                okfail(ndspTest.audioInitRc),
                R_SUCCEEDED(ndspTest.playRc) ? "OK" : "FAIL");
+        printf("    I2S1=0x%04X I2S2=0x%04X\n",
+               ndspTest.codec.i2sHw.i2s1, ndspTest.codec.i2sHw.i2s2);
         printf("    codec pages: %u/%u\n",
                count_valid_pages(&ndspTest.codec),
                (unsigned)CODEC_PAGE_COUNT);
@@ -303,6 +346,8 @@ static void draw(void)
         printf("    play rc=0x%08lX channel=%d\n",
                (unsigned long)csndTest.playRc,
                csndTest.channel);
+        printf("    I2S1=0x%04X I2S2=0x%04X\n",
+               csndTest.codec.i2sHw.i2s1, csndTest.codec.i2sHw.i2s2);
         printf("    codec pages: %u/%u\n",
                count_valid_pages(&csndTest.codec),
                (unsigned)CODEC_PAGE_COUNT);
@@ -310,7 +355,7 @@ static void draw(void)
 
     printf("\n[B] Save full report to SD\n");
     printf("[START] Exit\n\n");
-    printf("No CDCCHK writes in v0.4.\n");
+    printf("No register writes in v0.5.\n");
     printf("Run A, X and Y, then B.\n");
 }
 
@@ -335,6 +380,17 @@ static void dump_codec_snapshot(FILE *f, const char *name, const CodecSnapshot *
             (unsigned long)s->cdcInitRc, okfail(s->cdcInitRc));
     fprintf(f, "PDN_I2S_CNT=0x%02X PDN_DSP_CNT=0x%02X\n",
             s->pdn.i2s, s->pdn.dsp);
+    fprintf(f, "I2S1_CNT=0x%04X enable=%u freq=%u mclk=%u dsp_volume=%u\n",
+            s->i2sHw.i2s1,
+            !!(s->i2sHw.i2s1 & BIT(15)),
+            !!(s->i2sHw.i2s1 & BIT(13)),
+            !!(s->i2sHw.i2s1 & BIT(14)),
+            (unsigned)(s->i2sHw.i2s1 & 0x3F));
+    fprintf(f, "I2S2_CNT=0x%04X enable=%u freq=%u mclk=%u\n",
+            s->i2sHw.i2s2,
+            !!(s->i2sHw.i2s2 & BIT(15)),
+            !!(s->i2sHw.i2s2 & BIT(13)),
+            !!(s->i2sHw.i2s2 & BIT(14)));
 
     if (R_FAILED(s->cdcInitRc))
         return;
@@ -401,8 +457,8 @@ static bool save_report(void)
     if (!f)
         return false;
 
-    fprintf(f, "3DS Audio I2S Diagnostic v0.4\n");
-    fprintf(f, "Codec comparison build. CDCCHK register access is READ ONLY.\n");
+    fprintf(f, "3DS Audio I2S Diagnostic v0.5\n");
+    fprintf(f, "I2S controller + codec comparison. All register access is READ ONLY.\n");
     fprintf(f, "TONE=%dHz duration=%ds amplitude=%.0f/32767\n",
             (int)TONE_FREQ, TONE_SECONDS, TONE_AMPLITUDE);
     fprintf(f, "CODEC_READ_API=CDCCHK_ReadRegisters2\n");
@@ -419,6 +475,17 @@ static bool save_report(void)
             startup.dsp,
             !!(startup.dsp & BIT(0)),
             !!(startup.dsp & BIT(1)));
+    fprintf(f, "I2S1_CNT=0x%04X enable=%u freq=%u mclk=%u dsp_volume=%u\n",
+            startupI2s.i2s1,
+            !!(startupI2s.i2s1 & BIT(15)),
+            !!(startupI2s.i2s1 & BIT(13)),
+            !!(startupI2s.i2s1 & BIT(14)),
+            (unsigned)(startupI2s.i2s1 & 0x3F));
+    fprintf(f, "I2S2_CNT=0x%04X enable=%u freq=%u mclk=%u\n",
+            startupI2s.i2s2,
+            !!(startupI2s.i2s2 & BIT(15)),
+            !!(startupI2s.i2s2 & BIT(13)),
+            !!(startupI2s.i2s2 & BIT(14)));
 
     fprintf(f, "\nNDSP_TEST_ATTEMPTED=%u\n", ndspTest.attempted ? 1 : 0);
     if (ndspTest.attempted) {
@@ -462,6 +529,7 @@ int main(int argc, char **argv)
     consoleInit(GFX_TOP, NULL);
 
     startup = read_pdn();
+    startupI2s = read_i2s_hw();
     draw();
 
     while (aptMainLoop()) {
