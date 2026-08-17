@@ -33,31 +33,29 @@ static TestResult ndspTest;
 
 static PdnSnapshot read_pdn(void)
 {
-    __asm__ volatile("dmb" ::: "memory");
     PdnSnapshot s;
     s.i2s = REG8_RO(PDN_I2S_CNT_ADDR);
     s.dsp = REG8_RO(PDN_DSP_CNT_ADDR);
-    __asm__ volatile("dmb" ::: "memory");
     return s;
 }
 
-static const char *yn(bool v) { return v ? "ON" : "OFF"; }
+static const char *onoff(bool v) { return v ? "ON" : "OFF"; }
 
 static void print_snapshot(const char *label, PdnSnapshot s)
 {
     printf("%s\n", label);
     printf("  PDN_I2S_CNT: 0x%02X\n", s.i2s);
-    printf("    bit0 I2S1 clock*: %s\n", yn((s.i2s & BIT(0)) != 0));
-    printf("    bit1 I2S2 clock : %s\n", yn((s.i2s & BIT(1)) != 0));
+    printf("    bit0 I2S1 clock*: %s\n", onoff((s.i2s & BIT(0)) != 0));
+    printf("    bit1 I2S2 clock : %s\n", onoff((s.i2s & BIT(1)) != 0));
     printf("  PDN_DSP_CNT: 0x%02X\n", s.dsp);
-    printf("    bit0 DSP out-reset: %s\n", yn((s.dsp & BIT(0)) != 0));
-    printf("    bit1 DSP clock    : %s\n", yn((s.dsp & BIT(1)) != 0));
+    printf("    bit0 DSP out-reset: %s\n", onoff((s.dsp & BIT(0)) != 0));
+    printf("    bit1 DSP clock    : %s\n", onoff((s.dsp & BIT(1)) != 0));
 }
 
 static void draw(void)
 {
     printf("\x1b[2J\x1b[H");
-    printf("3DS Audio I2S Diagnostic v0.1\n");
+    printf("3DS Audio I2S Diagnostic v0.2\n");
     printf("READ-ONLY: no PDN/CODEC writes\n\n");
     print_snapshot("STARTUP", startup);
     printf("\n");
@@ -160,7 +158,7 @@ static bool save_report(void)
     FILE *f = fopen("sdmc:/3ds_audio_i2s_diag.txt", "w");
     if (!f) return false;
 
-    fprintf(f, "3DS Audio I2S Diagnostic v0.1\n");
+    fprintf(f, "3DS Audio I2S Diagnostic v0.2\n");
     fprintf(f, "READ-ONLY diagnostic; no PDN/CODEC writes.\n\n");
     fprint_snapshot(f, "STARTUP", startup);
 
