@@ -2,242 +2,214 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <stdint.h>
 
-// Physical PDN registers documented at 0x10141220 / 0x10141230.
-// In a 3DS user process, mapped IO uses +0x0EB00000 virtual offset.
-#define PDN_I2S_CNT_ADDR  ((uintptr_t)0x1EC41220)
-#define PDN_DSP_CNT_ADDR  ((uintptr_t)0x1EC41230)
-
-// I2S controller registers:
-// physical 0x10145000/0x10145002 -> user virtual 0x1EC45000/0x1EC45002.
-#define I2S1_CNT_ADDR     ((uintptr_t)0x1EC45000)
-#define I2S2_CNT_ADDR     ((uintptr_t)0x1EC45002)
+#define PDN_DSP_CNT_ADDR ((uintptr_t)0x1EC41230)
+#define I2S1_CNT_ADDR    ((uintptr_t)0x1EC45000)
+#define I2S2_CNT_ADDR    ((uintptr_t)0x1EC45002)
 
 #define REG8_RO(addr)  (*(volatile const u8  *)(addr))
 #define REG16_RO(addr) (*(volatile const u16 *)(addr))
 
-#define TONE_RATE       22050
-#define TONE_SECONDS    2
-#define TONE_FRAMES     (TONE_RATE * TONE_SECONDS)
-#define TONE_FREQ       440.0
-#define TONE_AMPLITUDE  5000.0
+#define INPUT_RATE       22050
+#define INPUT_SECONDS    2
+#define INPUT_FRAMES     (INPUT_RATE * INPUT_SECONDS)
+#define TONE_FREQ        440.0
+#define TONE_AMPLITUDE   7000.0
 
-#define CODEC_REG_COUNT 128
-
-// Curated pages: low pages + codec banks referenced by 3DS codec docs/research.
-// Reads only. Each page is read in two 64-byte chunks because cdc:CHK caps
-// each read command at 64 bytes.
-static const u8 codecPages[] = {
-    0x00, 0x01, 0x02, 0x03,
-    0x64, 0x65, 0x66, 0x67,
-    0x68, 0x69, 0x6A, 0x6B,
-    0x6C, 0x6D, 0x6E, 0x6F,
-    0xFF
-};
-
-#define CODEC_PAGE_COUNT (sizeof(codecPages) / sizeof(codecPages[0]))
+// NDSP capture is the final stereo PCM output at NDSP's native output rate.
+// Allocate enough room to avoid wrapping while a 2-second tone is captured.
+#define CAPTURE_SECONDS  3
+#define CAPTURE_RATE     ((u32)(NDSP_SAMPLE_RATE + 0.5))
+#define CAPTURE_FRAMES   ((u32)(CAPTURE_RATE * CAPTURE_SECONDS))
 
 typedef struct {
-    u8 i2s;
-    u8 dsp;
-} PdnSnapshot;
-
-typedef struct {
+    u8  pdnDsp;
     u16 i2s1;
     u16 i2s2;
-} I2sHwSnapshot;
-
-typedef struct {
-    Result rc0;
-    Result rc40;
-    bool valid0;
-    bool valid40;
-    u8 data[CODEC_REG_COUNT];
-} CodecPageDump;
+} HwSnapshot;
 
 typedef struct {
     bool attempted;
-    Result cdcInitRc;
-    PdnSnapshot pdn;
-    I2sHwSnapshot i2sHw;
-    CodecPageDump page[CODEC_PAGE_COUNT];
-} CodecSnapshot;
+    Result ndspRc;
+    u32 capturedFrames;
+    u32 firstActiveFrame;
+    u32 lastActiveFrame;
+    u32 nonzeroFrames;
+    int peakL;
+    int peakR;
+    double rmsL;
+    double rmsR;
+    double estimatedHz;
+    u32 droppedFrames;
+    HwSnapshot during;
+} CaptureResult;
 
 typedef struct {
     bool attempted;
-    Result audioInitRc;
+    Result csndRc;
     Result playRc;
     int channel;
-    PdnSnapshot pdnDuring;
-    CodecSnapshot codec;
-} AudioCodecTest;
+    u32 framesPlayed;
+    HwSnapshot during;
+} ReplayResult;
 
-static PdnSnapshot startup;
-static I2sHwSnapshot startupI2s;
-static CodecSnapshot baselineCodec;
-static AudioCodecTest ndspTest;
-static AudioCodecTest csndTest;
+static CaptureResult gCapture;
+static ReplayResult gReplay;
 
-static PdnSnapshot read_pdn(void)
+static s16 *gCapturePcm = NULL;   // interleaved stereo: L,R,L,R...
+static s16 *gReplayMono = NULL;   // left channel extracted from capture
+static u32 gReplayFrames = 0;
+
+static HwSnapshot read_hw(void)
 {
-    PdnSnapshot s;
-    s.i2s = REG8_RO(PDN_I2S_CNT_ADDR);
-    s.dsp = REG8_RO(PDN_DSP_CNT_ADDR);
-    return s;
-}
-
-static I2sHwSnapshot read_i2s_hw(void)
-{
-    I2sHwSnapshot s;
+    HwSnapshot s;
+    s.pdnDsp = REG8_RO(PDN_DSP_CNT_ADDR);
     s.i2s1 = REG16_RO(I2S1_CNT_ADDR);
     s.i2s2 = REG16_RO(I2S2_CNT_ADDR);
     return s;
 }
 
-static const char *okfail(Result rc)
+static int abs16_to_int(s16 v)
 {
-    return R_SUCCEEDED(rc) ? "OK" : "FAIL";
+    int x = (int)v;
+    return x < 0 ? -x : x;
 }
 
-static void print_pdn(PdnSnapshot s)
+static void fill_input_tone(u32 *buffer)
 {
-    printf("PDN I2S=0x%02X  DSP=0x%02X\n", s.i2s, s.dsp);
-    printf("DSP reset=%u clock=%u  I2S2=%u\n",
-           !!(s.dsp & BIT(0)),
-           !!(s.dsp & BIT(1)),
-           !!(s.i2s & BIT(1)));
-}
-
-static void print_i2s_hw(I2sHwSnapshot s)
-{
-    printf("I2S1_CNT=0x%04X en=%u freq=%u mclk=%u vol=%u\n",
-           s.i2s1,
-           !!(s.i2s1 & BIT(15)),
-           !!(s.i2s1 & BIT(13)),
-           !!(s.i2s1 & BIT(14)),
-           (unsigned)(s.i2s1 & 0x3F));
-    printf("I2S2_CNT=0x%04X en=%u freq=%u mclk=%u\n",
-           s.i2s2,
-           !!(s.i2s2 & BIT(15)),
-           !!(s.i2s2 & BIT(13)),
-           !!(s.i2s2 & BIT(14)));
-}
-
-static bool capture_codec(CodecSnapshot *out)
-{
-    memset(out, 0, sizeof(*out));
-    out->attempted = true;
-    out->pdn = read_pdn();
-    out->i2sHw = read_i2s_hw();
-
-    out->cdcInitRc = cdcChkInit();
-    if (R_FAILED(out->cdcInitRc))
-        return false;
-
-    for (size_t i = 0; i < CODEC_PAGE_COUNT; i++) {
-        CodecPageDump *p = &out->page[i];
-        memset(p->data, 0xEE, sizeof(p->data));
-
-        p->rc0 = CDCCHK_ReadRegisters2(codecPages[i], 0x00, &p->data[0x00], 64);
-        p->valid0 = R_SUCCEEDED(p->rc0);
-
-        p->rc40 = CDCCHK_ReadRegisters2(codecPages[i], 0x40, &p->data[0x40], 64);
-        p->valid40 = R_SUCCEEDED(p->rc40);
-    }
-
-    cdcChkExit();
-    return true;
-}
-
-static void fill_stereo_tone(u32 *buffer)
-{
-    for (size_t i = 0; i < TONE_FRAMES; i++) {
-        double phase = (2.0 * M_PI * TONE_FREQ * (double)i) / (double)TONE_RATE;
+    for (u32 i = 0; i < INPUT_FRAMES; i++) {
+        double phase = (2.0 * M_PI * TONE_FREQ * (double)i) / (double)INPUT_RATE;
         s16 sample = (s16)(sin(phase) * TONE_AMPLITUDE);
         u16 us = (u16)sample;
         buffer[i] = ((u32)us << 16) | (u32)us;
     }
 }
 
-static void fill_mono_tone(s16 *buffer)
+static void analyze_capture(u32 frames)
 {
-    for (size_t i = 0; i < TONE_FRAMES; i++) {
-        double phase = (2.0 * M_PI * TONE_FREQ * (double)i) / (double)TONE_RATE;
-        buffer[i] = (s16)(sin(phase) * TONE_AMPLITUDE);
+    gCapture.capturedFrames = frames;
+    gCapture.firstActiveFrame = frames;
+    gCapture.lastActiveFrame = 0;
+    gCapture.nonzeroFrames = 0;
+    gCapture.peakL = 0;
+    gCapture.peakR = 0;
+    gCapture.rmsL = 0.0;
+    gCapture.rmsR = 0.0;
+    gCapture.estimatedHz = 0.0;
+
+    if (!gCapturePcm || frames == 0)
+        return;
+
+    const int activeThreshold = 32;
+    long double sumSqL = 0.0L;
+    long double sumSqR = 0.0L;
+
+    for (u32 i = 0; i < frames; i++) {
+        s16 l = gCapturePcm[i * 2 + 0];
+        s16 r = gCapturePcm[i * 2 + 1];
+
+        int al = abs16_to_int(l);
+        int ar = abs16_to_int(r);
+
+        if (al > gCapture.peakL) gCapture.peakL = al;
+        if (ar > gCapture.peakR) gCapture.peakR = ar;
+
+        sumSqL += (long double)l * (long double)l;
+        sumSqR += (long double)r * (long double)r;
+
+        if (al > activeThreshold || ar > activeThreshold) {
+            if (gCapture.firstActiveFrame == frames)
+                gCapture.firstActiveFrame = i;
+            gCapture.lastActiveFrame = i;
+            gCapture.nonzeroFrames++;
+        }
+    }
+
+    gCapture.rmsL = sqrt((double)(sumSqL / (long double)frames));
+    gCapture.rmsR = sqrt((double)(sumSqR / (long double)frames));
+
+    if (gCapture.firstActiveFrame < frames &&
+        gCapture.lastActiveFrame > gCapture.firstActiveFrame) {
+
+        u32 crossings = 0;
+        s16 prev = gCapturePcm[gCapture.firstActiveFrame * 2];
+
+        for (u32 i = gCapture.firstActiveFrame + 1;
+             i <= gCapture.lastActiveFrame; i++) {
+            s16 cur = gCapturePcm[i * 2];
+            if (prev <= 0 && cur > 0)
+                crossings++;
+            prev = cur;
+        }
+
+        double duration = (double)(gCapture.lastActiveFrame -
+                                   gCapture.firstActiveFrame) /
+                          (double)CAPTURE_RATE;
+
+        if (duration > 0.0)
+            gCapture.estimatedHz = (double)crossings / duration;
     }
 }
 
-static void run_ndsp_test(void)
+static void prepare_replay_buffer(void)
 {
-    memset(&ndspTest, 0, sizeof(ndspTest));
-    ndspTest.attempted = true;
-    ndspTest.channel = 0;
-    ndspTest.playRc = (Result)-1;
+    if (gReplayMono) {
+        linearFree(gReplayMono);
+        gReplayMono = NULL;
+    }
+    gReplayFrames = 0;
 
-    const size_t bytes = TONE_FRAMES * sizeof(u32);
-    u32 *audio = (u32 *)linearAlloc(bytes);
-    if (!audio) {
-        ndspTest.audioInitRc = (Result)-1;
+    if (!gCapturePcm || gCapture.capturedFrames == 0)
+        return;
+
+    u32 start = 0;
+    u32 end = gCapture.capturedFrames;
+
+    // Trim most leading/trailing silence, but keep a short margin.
+    if (gCapture.firstActiveFrame < gCapture.capturedFrames) {
+        const u32 margin = 320;
+
+        start = gCapture.firstActiveFrame > margin
+              ? gCapture.firstActiveFrame - margin
+              : 0;
+
+        end = gCapture.lastActiveFrame + margin + 1;
+        if (end > gCapture.capturedFrames)
+            end = gCapture.capturedFrames;
+    }
+
+    if (end <= start)
+        return;
+
+    gReplayFrames = end - start;
+    gReplayMono = (s16 *)linearAlloc(gReplayFrames * sizeof(s16));
+    if (!gReplayMono) {
+        gReplayFrames = 0;
         return;
     }
 
-    fill_stereo_tone(audio);
-    DSP_FlushDataCache(audio, bytes);
-
-    ndspTest.audioInitRc = ndspInit();
-    if (R_FAILED(ndspTest.audioInitRc)) {
-        linearFree(audio);
-        return;
-    }
-
-    ndspSetOutputMode(NDSP_OUTPUT_STEREO);
-    ndspChnReset(0);
-    ndspChnSetInterp(0, NDSP_INTERP_LINEAR);
-    ndspChnSetRate(0, TONE_RATE);
-    ndspChnSetFormat(0, NDSP_FORMAT_STEREO_PCM16);
-
-    float mix[12];
-    memset(mix, 0, sizeof(mix));
-    mix[0] = 1.0f;
-    mix[1] = 1.0f;
-    ndspChnSetMix(0, mix);
-
-    ndspWaveBuf wave;
-    memset(&wave, 0, sizeof(wave));
-    wave.data_vaddr = audio;
-    wave.nsamples = TONE_FRAMES;
-
-    ndspChnWaveBufAdd(0, &wave);
-    ndspTest.playRc = 0;
-
-    // Snapshot while DSP/NDSP is actively processing the tone.
-    svcSleepThread(50 * 1000 * 1000LL);
-    ndspTest.pdnDuring = read_pdn();
-    capture_codec(&ndspTest.codec);
-
-    svcSleepThread((TONE_SECONDS * 1000LL - 50LL + 150LL) * 1000LL * 1000LL);
-
-    ndspChnReset(0);
-    ndspExit();
-    linearFree(audio);
+    // The diagnostic tone is identical in L/R, so using the left channel
+    // gives CSND a normal mono PCM16 stream.
+    for (u32 i = 0; i < gReplayFrames; i++)
+        gReplayMono[i] = gCapturePcm[(start + i) * 2];
 }
 
 static Result play_csnd_first_available(s16 *audio, u32 bytes, int *usedChannel)
 {
-    // csndPlaySound() returns 1 if a requested channel was not acquired.
-    // Try channels until one is available.
     for (int ch = 0; ch < CSND_NUM_CHANNELS; ch++) {
         Result rc = csndPlaySound(
             ch,
             SOUND_FORMAT_16BIT | SOUND_ONE_SHOT | SOUND_LINEAR_INTERP,
-            TONE_RATE,
-            0.50f,
+            CAPTURE_RATE,
+            1.0f,
             0.0f,
             audio,
             audio,
             bytes
         );
 
+        // libctru returns 1 when the requested channel could not be acquired.
         if (rc != 1) {
             *usedChannel = ch;
             return rc;
@@ -248,207 +220,204 @@ static Result play_csnd_first_available(s16 *audio, u32 bytes, int *usedChannel)
     return 1;
 }
 
-static void run_csnd_test(void)
+static void run_direct_csnd_reference(void)
 {
-    memset(&csndTest, 0, sizeof(csndTest));
-    csndTest.attempted = true;
-    csndTest.channel = -1;
-    csndTest.playRc = (Result)-1;
+    const u32 frames = CAPTURE_RATE;
+    const u32 bytes = frames * sizeof(s16);
 
-    const u32 bytes = (u32)(TONE_FRAMES * sizeof(s16));
-    s16 *audio = (s16 *)linearAlloc(bytes);
-    if (!audio) {
-        csndTest.audioInitRc = (Result)-1;
+    s16 *tone = (s16 *)linearAlloc(bytes);
+    if (!tone)
+        return;
+
+    for (u32 i = 0; i < frames; i++) {
+        double phase = (2.0 * M_PI * TONE_FREQ * (double)i) /
+                       (double)CAPTURE_RATE;
+        tone[i] = (s16)(sin(phase) * TONE_AMPLITUDE);
+    }
+
+    Result rc = csndInit();
+    if (R_SUCCEEDED(rc)) {
+        GSPGPU_FlushDataCache(tone, bytes);
+        int ch = -1;
+        play_csnd_first_available(tone, bytes, &ch);
+        svcSleepThread(1200LL * 1000LL * 1000LL);
+        csndExit();
+    }
+
+    linearFree(tone);
+}
+
+static void run_ndsp_capture(void)
+{
+    memset(&gCapture, 0, sizeof(gCapture));
+    gCapture.attempted = true;
+    gCapture.ndspRc = (Result)-1;
+
+    if (gCapturePcm) {
+        linearFree(gCapturePcm);
+        gCapturePcm = NULL;
+    }
+    if (gReplayMono) {
+        linearFree(gReplayMono);
+        gReplayMono = NULL;
+    }
+    gReplayFrames = 0;
+    memset(&gReplay, 0, sizeof(gReplay));
+
+    u32 *input = (u32 *)linearAlloc(INPUT_FRAMES * sizeof(u32));
+    gCapturePcm = (s16 *)linearAlloc(CAPTURE_FRAMES * 2 * sizeof(s16));
+
+    if (!input || !gCapturePcm) {
+        if (input) linearFree(input);
+        if (gCapturePcm) {
+            linearFree(gCapturePcm);
+            gCapturePcm = NULL;
+        }
         return;
     }
 
-    fill_mono_tone(audio);
+    memset(gCapturePcm, 0, CAPTURE_FRAMES * 2 * sizeof(s16));
+    fill_input_tone(input);
+    DSP_FlushDataCache(input, INPUT_FRAMES * sizeof(u32));
 
-    csndTest.audioInitRc = csndInit();
-    if (R_FAILED(csndTest.audioInitRc)) {
-        linearFree(audio);
+    gCapture.ndspRc = ndspInit();
+    if (R_FAILED(gCapture.ndspRc)) {
+        linearFree(input);
         return;
     }
 
-    GSPGPU_FlushDataCache(audio, bytes);
-    csndTest.playRc = play_csnd_first_available(audio, bytes, &csndTest.channel);
+    ndspSetOutputMode(NDSP_OUTPUT_STEREO);
+    ndspSetMasterVol(1.0f);
 
-    // Snapshot while CSND/I2S2 is actively playing.
-    svcSleepThread(50 * 1000 * 1000LL);
-    csndTest.pdnDuring = read_pdn();
-    capture_codec(&csndTest.codec);
+    ndspWaveBuf capture;
+    memset(&capture, 0, sizeof(capture));
+    capture.data_pcm16 = gCapturePcm;
+    capture.nsamples = CAPTURE_FRAMES;
+    capture.offset = 0;
 
-    svcSleepThread((TONE_SECONDS * 1000LL - 50LL + 150LL) * 1000LL * 1000LL);
+    ndspSetCapture(&capture);
+
+    ndspChnReset(0);
+    ndspChnSetInterp(0, NDSP_INTERP_LINEAR);
+    ndspChnSetRate(0, INPUT_RATE);
+    ndspChnSetFormat(0, NDSP_FORMAT_STEREO_PCM16);
+
+    float mix[12];
+    memset(mix, 0, sizeof(mix));
+    mix[0] = 1.0f;
+    mix[1] = 1.0f;
+    ndspChnSetMix(0, mix);
+
+    ndspWaveBuf wave;
+    memset(&wave, 0, sizeof(wave));
+    wave.data_vaddr = input;
+    wave.nsamples = INPUT_FRAMES;
+
+    ndspChnWaveBufAdd(0, &wave);
+
+    // Let the DSP produce almost the whole 2-second tone.
+    svcSleepThread(100LL * 1000LL * 1000LL);
+    gCapture.during = read_hw();
+
+    // Total capture time 2.25 s: under the 3 s buffer, so no wrap expected.
+    svcSleepThread(2150LL * 1000LL * 1000LL);
+
+    ndspSetCapture(NULL);
+
+    u32 frames = capture.offset;
+    if (frames > CAPTURE_FRAMES)
+        frames = CAPTURE_FRAMES;
+
+    gCapture.droppedFrames = ndspGetDroppedFrames();
+
+    ndspChnReset(0);
+    ndspExit();
+    linearFree(input);
+
+    analyze_capture(frames);
+    prepare_replay_buffer();
+}
+
+static void run_csnd_replay(void)
+{
+    memset(&gReplay, 0, sizeof(gReplay));
+    gReplay.attempted = true;
+    gReplay.channel = -1;
+    gReplay.framesPlayed = gReplayFrames;
+    gReplay.csndRc = (Result)-1;
+    gReplay.playRc = (Result)-1;
+
+    if (!gReplayMono || gReplayFrames == 0)
+        return;
+
+    gReplay.csndRc = csndInit();
+    if (R_FAILED(gReplay.csndRc))
+        return;
+
+    u32 bytes = gReplayFrames * sizeof(s16);
+    GSPGPU_FlushDataCache(gReplayMono, bytes);
+
+    gReplay.playRc = play_csnd_first_available(
+        gReplayMono, bytes, &gReplay.channel);
+
+    svcSleepThread(50LL * 1000LL * 1000LL);
+    gReplay.during = read_hw();
+
+    u64 ms = ((u64)gReplayFrames * 1000ULL) / (u64)CAPTURE_RATE;
+    svcSleepThread((s64)(ms + 250ULL) * 1000LL * 1000LL);
 
     csndExit();
-    linearFree(audio);
 }
 
-static unsigned count_valid_pages(const CodecSnapshot *s)
+static void write_u16_le(FILE *f, u16 v)
 {
-    if (!s->attempted || R_FAILED(s->cdcInitRc))
-        return 0;
-
-    unsigned n = 0;
-    for (size_t i = 0; i < CODEC_PAGE_COUNT; i++) {
-        if (s->page[i].valid0 && s->page[i].valid40)
-            n++;
-    }
-    return n;
+    u8 b[2] = { (u8)(v & 0xFF), (u8)((v >> 8) & 0xFF) };
+    fwrite(b, 1, 2, f);
 }
 
-static void draw(void)
+static void write_u32_le(FILE *f, u32 v)
 {
-    printf("\x1b[2J\x1b[H");
-    printf("3DS Audio I2S Diagnostic v0.5\n");
-    printf("I2S controller + CODEC - READ ONLY\n\n");
-
-    printf("STARTUP:\n");
-    print_pdn(startup);
-    print_i2s_hw(startupI2s);
-    printf("\n");
-
-    if (!baselineCodec.attempted) {
-        printf("[A] Capture CODEC baseline\n");
-    } else {
-        printf("[A] Baseline cdc:CHK: 0x%08lX %s\n",
-               (unsigned long)baselineCodec.cdcInitRc,
-               okfail(baselineCodec.cdcInitRc));
-        printf("    I2S1=0x%04X I2S2=0x%04X\n",
-               baselineCodec.i2sHw.i2s1, baselineCodec.i2sHw.i2s2);
-        printf("    full pages read: %u/%u\n",
-               count_valid_pages(&baselineCodec),
-               (unsigned)CODEC_PAGE_COUNT);
-    }
-
-    printf("\n");
-    if (!ndspTest.attempted) {
-        printf("[X] NDSP tone + CODEC snapshot\n");
-    } else {
-        printf("[X] NDSP init: 0x%08lX %s  play:%s\n",
-               (unsigned long)ndspTest.audioInitRc,
-               okfail(ndspTest.audioInitRc),
-               R_SUCCEEDED(ndspTest.playRc) ? "OK" : "FAIL");
-        printf("    I2S1=0x%04X I2S2=0x%04X\n",
-               ndspTest.codec.i2sHw.i2s1, ndspTest.codec.i2sHw.i2s2);
-        printf("    codec pages: %u/%u\n",
-               count_valid_pages(&ndspTest.codec),
-               (unsigned)CODEC_PAGE_COUNT);
-    }
-
-    printf("\n");
-    if (!csndTest.attempted) {
-        printf("[Y] CSND tone + CODEC snapshot\n");
-    } else {
-        printf("[Y] CSND init: 0x%08lX %s\n",
-               (unsigned long)csndTest.audioInitRc,
-               okfail(csndTest.audioInitRc));
-        printf("    play rc=0x%08lX channel=%d\n",
-               (unsigned long)csndTest.playRc,
-               csndTest.channel);
-        printf("    I2S1=0x%04X I2S2=0x%04X\n",
-               csndTest.codec.i2sHw.i2s1, csndTest.codec.i2sHw.i2s2);
-        printf("    codec pages: %u/%u\n",
-               count_valid_pages(&csndTest.codec),
-               (unsigned)CODEC_PAGE_COUNT);
-    }
-
-    printf("\n[B] Save full report to SD\n");
-    printf("[START] Exit\n\n");
-    printf("No register writes in v0.5.\n");
-    printf("Run A, X and Y, then B.\n");
+    u8 b[4] = {
+        (u8)(v & 0xFF),
+        (u8)((v >> 8) & 0xFF),
+        (u8)((v >> 16) & 0xFF),
+        (u8)((v >> 24) & 0xFF)
+    };
+    fwrite(b, 1, 4, f);
 }
 
-static void dump_hex_line(FILE *f, const u8 *data, unsigned start)
+static bool save_capture_wav(void)
 {
-    fprintf(f, "%02X: ", start);
-    for (unsigned i = 0; i < 16; i++)
-        fprintf(f, "%02X%s", data[start + i], (i == 15) ? "" : " ");
-    fprintf(f, "\n");
-}
+    if (!gCapturePcm || gCapture.capturedFrames == 0)
+        return false;
 
-static void dump_codec_snapshot(FILE *f, const char *name, const CodecSnapshot *s)
-{
-    fprintf(f, "\n=== %s ===\n", name);
+    FILE *f = fopen("sdmc:/ndsp_capture.wav", "wb");
+    if (!f)
+        return false;
 
-    if (!s->attempted) {
-        fprintf(f, "NOT_CAPTURED\n");
-        return;
-    }
+    u32 dataBytes = gCapture.capturedFrames * 2 * sizeof(s16);
+    u32 byteRate = CAPTURE_RATE * 2 * sizeof(s16);
+    u16 blockAlign = 2 * sizeof(s16);
 
-    fprintf(f, "CDCCHK_INIT rc=0x%08lX (%s)\n",
-            (unsigned long)s->cdcInitRc, okfail(s->cdcInitRc));
-    fprintf(f, "PDN_I2S_CNT=0x%02X PDN_DSP_CNT=0x%02X\n",
-            s->pdn.i2s, s->pdn.dsp);
-    fprintf(f, "I2S1_CNT=0x%04X enable=%u freq=%u mclk=%u dsp_volume=%u\n",
-            s->i2sHw.i2s1,
-            !!(s->i2sHw.i2s1 & BIT(15)),
-            !!(s->i2sHw.i2s1 & BIT(13)),
-            !!(s->i2sHw.i2s1 & BIT(14)),
-            (unsigned)(s->i2sHw.i2s1 & 0x3F));
-    fprintf(f, "I2S2_CNT=0x%04X enable=%u freq=%u mclk=%u\n",
-            s->i2sHw.i2s2,
-            !!(s->i2sHw.i2s2 & BIT(15)),
-            !!(s->i2sHw.i2s2 & BIT(13)),
-            !!(s->i2sHw.i2s2 & BIT(14)));
+    fwrite("RIFF", 1, 4, f);
+    write_u32_le(f, 36 + dataBytes);
+    fwrite("WAVE", 1, 4, f);
 
-    if (R_FAILED(s->cdcInitRc))
-        return;
+    fwrite("fmt ", 1, 4, f);
+    write_u32_le(f, 16);
+    write_u16_le(f, 1);            // PCM
+    write_u16_le(f, 2);            // stereo
+    write_u32_le(f, CAPTURE_RATE);
+    write_u32_le(f, byteRate);
+    write_u16_le(f, blockAlign);
+    write_u16_le(f, 16);
 
-    for (size_t i = 0; i < CODEC_PAGE_COUNT; i++) {
-        const CodecPageDump *p = &s->page[i];
+    fwrite("data", 1, 4, f);
+    write_u32_le(f, dataBytes);
+    fwrite(gCapturePcm, 1, dataBytes, f);
 
-        fprintf(f, "\nPAGE 0x%02X\n", codecPages[i]);
-        fprintf(f, "READ_00_3F rc=0x%08lX (%s)\n",
-                (unsigned long)p->rc0, okfail(p->rc0));
-        fprintf(f, "READ_40_7F rc=0x%08lX (%s)\n",
-                (unsigned long)p->rc40, okfail(p->rc40));
-
-        if (!(p->valid0 || p->valid40))
-            continue;
-
-        for (unsigned off = 0; off < CODEC_REG_COUNT; off += 16) {
-            // Print a chunk if its containing 64-byte read succeeded.
-            if ((off < 0x40 && p->valid0) || (off >= 0x40 && p->valid40))
-                dump_hex_line(f, p->data, off);
-        }
-    }
-}
-
-static void dump_diff(FILE *f,
-                      const char *nameA, const CodecSnapshot *a,
-                      const char *nameB, const CodecSnapshot *b)
-{
-    fprintf(f, "\n=== DIFF %s -> %s ===\n", nameA, nameB);
-
-    if (!a->attempted || !b->attempted ||
-        R_FAILED(a->cdcInitRc) || R_FAILED(b->cdcInitRc)) {
-        fprintf(f, "DIFF_UNAVAILABLE\n");
-        return;
-    }
-
-    unsigned changes = 0;
-
-    for (size_t i = 0; i < CODEC_PAGE_COUNT; i++) {
-        const CodecPageDump *pa = &a->page[i];
-        const CodecPageDump *pb = &b->page[i];
-
-        for (unsigned reg = 0; reg < CODEC_REG_COUNT; reg++) {
-            bool validA = reg < 0x40 ? pa->valid0 : pa->valid40;
-            bool validB = reg < 0x40 ? pb->valid0 : pb->valid40;
-
-            if (!validA || !validB)
-                continue;
-
-            if (pa->data[reg] != pb->data[reg]) {
-                fprintf(f, "P%02X:R%02X %02X -> %02X\n",
-                        codecPages[i], reg, pa->data[reg], pb->data[reg]);
-                changes++;
-            }
-        }
-    }
-
-    fprintf(f, "TOTAL_CHANGED_REGISTERS=%u\n", changes);
+    fclose(f);
+    return true;
 }
 
 static bool save_report(void)
@@ -457,67 +426,108 @@ static bool save_report(void)
     if (!f)
         return false;
 
-    fprintf(f, "3DS Audio I2S Diagnostic v0.5\n");
-    fprintf(f, "I2S controller + codec comparison. All register access is READ ONLY.\n");
-    fprintf(f, "TONE=%dHz duration=%ds amplitude=%.0f/32767\n",
-            (int)TONE_FREQ, TONE_SECONDS, TONE_AMPLITUDE);
-    fprintf(f, "CODEC_READ_API=CDCCHK_ReadRegisters2\n");
-    fprintf(f, "CODEC_PAGES=");
-    for (size_t i = 0; i < CODEC_PAGE_COUNT; i++)
-        fprintf(f, "%02X%s", codecPages[i], (i + 1 == CODEC_PAGE_COUNT) ? "\n" : ",");
+    fprintf(f, "3DS Audio I2S Diagnostic v0.6\n");
+    fprintf(f, "NDSP final-mix capture -> CSND bridge proof\n");
+    fprintf(f, "INPUT_TONE=%dHz input_rate=%d input_seconds=%d\n",
+            (int)TONE_FREQ, INPUT_RATE, INPUT_SECONDS);
+    fprintf(f, "NDSP_NATIVE_CAPTURE_RATE=%lu\n",
+            (unsigned long)CAPTURE_RATE);
 
-    fprintf(f, "\nSTARTUP\n");
-    fprintf(f, "PDN_I2S_CNT=0x%02X I2S1_bit0=%u I2S2_bit1=%u\n",
-            startup.i2s,
-            !!(startup.i2s & BIT(0)),
-            !!(startup.i2s & BIT(1)));
-    fprintf(f, "PDN_DSP_CNT=0x%02X DSP_out_reset_bit0=%u DSP_clock_bit1=%u\n",
-            startup.dsp,
-            !!(startup.dsp & BIT(0)),
-            !!(startup.dsp & BIT(1)));
-    fprintf(f, "I2S1_CNT=0x%04X enable=%u freq=%u mclk=%u dsp_volume=%u\n",
-            startupI2s.i2s1,
-            !!(startupI2s.i2s1 & BIT(15)),
-            !!(startupI2s.i2s1 & BIT(13)),
-            !!(startupI2s.i2s1 & BIT(14)),
-            (unsigned)(startupI2s.i2s1 & 0x3F));
-    fprintf(f, "I2S2_CNT=0x%04X enable=%u freq=%u mclk=%u\n",
-            startupI2s.i2s2,
-            !!(startupI2s.i2s2 & BIT(15)),
-            !!(startupI2s.i2s2 & BIT(13)),
-            !!(startupI2s.i2s2 & BIT(14)));
+    fprintf(f, "\n=== NDSP_CAPTURE ===\n");
+    fprintf(f, "ATTEMPTED=%u\n", gCapture.attempted ? 1 : 0);
+    fprintf(f, "NDSP_INIT rc=0x%08lX (%s)\n",
+            (unsigned long)gCapture.ndspRc,
+            R_SUCCEEDED(gCapture.ndspRc) ? "OK" : "FAIL");
+    fprintf(f, "CAPTURED_FRAMES=%lu\n",
+            (unsigned long)gCapture.capturedFrames);
+    fprintf(f, "CAPTURED_SECONDS=%.6f\n",
+            (double)gCapture.capturedFrames / (double)CAPTURE_RATE);
+    fprintf(f, "FIRST_ACTIVE_FRAME=%lu\n",
+            (unsigned long)gCapture.firstActiveFrame);
+    fprintf(f, "LAST_ACTIVE_FRAME=%lu\n",
+            (unsigned long)gCapture.lastActiveFrame);
+    fprintf(f, "NONZERO_ACTIVE_FRAMES=%lu\n",
+            (unsigned long)gCapture.nonzeroFrames);
+    fprintf(f, "PEAK_L=%d PEAK_R=%d\n",
+            gCapture.peakL, gCapture.peakR);
+    fprintf(f, "RMS_L=%.3f RMS_R=%.3f\n",
+            gCapture.rmsL, gCapture.rmsR);
+    fprintf(f, "ESTIMATED_CAPTURE_FREQ_HZ=%.3f\n",
+            gCapture.estimatedHz);
+    fprintf(f, "DROPPED_FRAMES=%lu\n",
+            (unsigned long)gCapture.droppedFrames);
+    fprintf(f, "HW_DURING_NDSP PDN_DSP=0x%02X I2S1_CNT=0x%04X I2S2_CNT=0x%04X\n",
+            gCapture.during.pdnDsp,
+            gCapture.during.i2s1,
+            gCapture.during.i2s2);
 
-    fprintf(f, "\nNDSP_TEST_ATTEMPTED=%u\n", ndspTest.attempted ? 1 : 0);
-    if (ndspTest.attempted) {
-        fprintf(f, "NDSP_INIT rc=0x%08lX (%s)\n",
-                (unsigned long)ndspTest.audioInitRc, okfail(ndspTest.audioInitRc));
-        fprintf(f, "NDSP_PLAY rc=0x%08lX (%s)\n",
-                (unsigned long)ndspTest.playRc, okfail(ndspTest.playRc));
-        fprintf(f, "NDSP_PDN_DURING I2S=0x%02X DSP=0x%02X\n",
-                ndspTest.pdnDuring.i2s, ndspTest.pdnDuring.dsp);
-    }
+    fprintf(f, "\n=== CSND_REPLAY_OF_DSP_CAPTURE ===\n");
+    fprintf(f, "ATTEMPTED=%u\n", gReplay.attempted ? 1 : 0);
+    fprintf(f, "CSND_INIT rc=0x%08lX (%s)\n",
+            (unsigned long)gReplay.csndRc,
+            R_SUCCEEDED(gReplay.csndRc) ? "OK" : "FAIL");
+    fprintf(f, "CSND_PLAY rc=0x%08lX (%s)\n",
+            (unsigned long)gReplay.playRc,
+            R_SUCCEEDED(gReplay.playRc) ? "OK" : "FAIL");
+    fprintf(f, "CSND_CHANNEL=%d\n", gReplay.channel);
+    fprintf(f, "REPLAY_FRAMES=%lu\n",
+            (unsigned long)gReplay.framesPlayed);
+    fprintf(f, "HW_DURING_CSND PDN_DSP=0x%02X I2S1_CNT=0x%04X I2S2_CNT=0x%04X\n",
+            gReplay.during.pdnDsp,
+            gReplay.during.i2s1,
+            gReplay.during.i2s2);
 
-    fprintf(f, "\nCSND_TEST_ATTEMPTED=%u\n", csndTest.attempted ? 1 : 0);
-    if (csndTest.attempted) {
-        fprintf(f, "CSND_INIT rc=0x%08lX (%s)\n",
-                (unsigned long)csndTest.audioInitRc, okfail(csndTest.audioInitRc));
-        fprintf(f, "CSND_PLAY rc=0x%08lX (%s)\n",
-                (unsigned long)csndTest.playRc, okfail(csndTest.playRc));
-        fprintf(f, "CSND_CHANNEL=%d\n", csndTest.channel);
-        fprintf(f, "CSND_PDN_DURING I2S=0x%02X DSP=0x%02X\n",
-                csndTest.pdnDuring.i2s, csndTest.pdnDuring.dsp);
-    }
+    bool capturedSignal =
+        gCapture.capturedFrames > 0 &&
+        gCapture.peakL > 128 &&
+        gCapture.nonzeroFrames > 1000;
 
-    dump_codec_snapshot(f, "CODEC_BASELINE", &baselineCodec);
-    dump_codec_snapshot(f, "CODEC_DURING_NDSP", &ndspTest.codec);
-    dump_codec_snapshot(f, "CODEC_DURING_CSND", &csndTest.codec);
-
-    dump_diff(f, "BASELINE", &baselineCodec, "NDSP", &ndspTest.codec);
-    dump_diff(f, "BASELINE", &baselineCodec, "CSND", &csndTest.codec);
-    dump_diff(f, "NDSP", &ndspTest.codec, "CSND", &csndTest.codec);
+    fprintf(f, "\n=== INTERPRETATION ===\n");
+    fprintf(f, "DSP_FINAL_PCM_CAPTURE_HAS_SIGNAL=%u\n",
+            capturedSignal ? 1 : 0);
+    fprintf(f, "EXPECTED_TEST_TONE_HZ=440\n");
+    fprintf(f, "If Y is audible and ESTIMATED_CAPTURE_FREQ_HZ is near 440,\n");
+    fprintf(f, "the DSP final mix is valid and replayable through CSND/I2S2.\n");
 
     fclose(f);
     return true;
+}
+
+static void draw(void)
+{
+    printf("\x1b[2J\x1b[H");
+    printf("3DS Audio I2S Diagnostic v0.6\n");
+    printf("DSP final PCM -> CSND bridge test\n\n");
+
+    printf("[A] Direct CSND 440Hz reference\n");
+    printf("    (should be audible on your console)\n\n");
+
+    printf("[X] Generate tone in NDSP + CAPTURE FINAL MIX\n");
+    if (gCapture.attempted) {
+        printf("    ndsp: %s  captured: %lu frames\n",
+               R_SUCCEEDED(gCapture.ndspRc) ? "OK" : "FAIL",
+               (unsigned long)gCapture.capturedFrames);
+        printf("    peak L/R: %d / %d\n",
+               gCapture.peakL, gCapture.peakR);
+        printf("    RMS L/R: %.1f / %.1f\n",
+               gCapture.rmsL, gCapture.rmsR);
+        printf("    estimated: %.1f Hz\n",
+               gCapture.estimatedHz);
+    }
+
+    printf("\n[Y] Replay CAPTURED DSP PCM through CSND\n");
+    if (gReplay.attempted) {
+        printf("    csnd: %s  play: %s  ch:%d\n",
+               R_SUCCEEDED(gReplay.csndRc) ? "OK" : "FAIL",
+               R_SUCCEEDED(gReplay.playRc) ? "OK" : "FAIL",
+               gReplay.channel);
+    }
+
+    printf("\n[B] Save log + ndsp_capture.wav\n");
+    printf("[START] Exit\n\n");
+
+    printf("Sequence: A -> X -> Y -> B\n");
+    printf("Most important: tell me if Y is audible.\n");
 }
 
 int main(int argc, char **argv)
@@ -528,8 +538,6 @@ int main(int argc, char **argv)
     gfxInitDefault();
     consoleInit(GFX_TOP, NULL);
 
-    startup = read_pdn();
-    startupI2s = read_i2s_hw();
     draw();
 
     while (aptMainLoop()) {
@@ -540,29 +548,37 @@ int main(int argc, char **argv)
             break;
 
         if (down & KEY_A) {
-            capture_codec(&baselineCodec);
+            run_direct_csnd_reference();
             draw();
         }
 
         if (down & KEY_X) {
-            run_ndsp_test();
+            run_ndsp_capture();
             draw();
         }
 
         if (down & KEY_Y) {
-            run_csnd_test();
+            run_csnd_replay();
             draw();
         }
 
         if (down & KEY_B) {
-            bool ok = save_report();
+            bool logOk = save_report();
+            bool wavOk = save_capture_wav();
             draw();
-            printf("\nReport: %s\n",
-                   ok ? "sdmc:/3ds_audio_i2s_diag.txt" : "FAILED TO SAVE");
+            printf("\nlog: %s\n", logOk ? "saved" : "FAILED");
+            printf("wav: %s\n", wavOk ? "saved" : "FAILED");
+            printf("sd:/3ds_audio_i2s_diag.txt\n");
+            printf("sd:/ndsp_capture.wav\n");
         }
 
         gspWaitForVBlank();
     }
+
+    if (gReplayMono)
+        linearFree(gReplayMono);
+    if (gCapturePcm)
+        linearFree(gCapturePcm);
 
     gfxExit();
     return 0;
