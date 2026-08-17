@@ -1,0 +1,4 @@
+This package contains a complete diagnostic source project.
+The current execution environment used to prepare it does not have devkitARM/libctru/makerom/bannertool installed, so the CIA binary could not be compiled here.
+
+The code is intentionally read-only at the PDN/CODEC register level.
